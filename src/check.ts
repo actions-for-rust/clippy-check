@@ -1,53 +1,84 @@
-import * as core from '@actions/core';
-import * as github from '@actions/github';
-
-const pkg = require('../package.json');
-import {plural} from './render';
+import * as core from "@actions/core";
+import * as github from "@actions/github";
+import * as pkg from "../package.json";
+import type { GitHub } from "@actions/github/lib/utils";
+import { getErrorMessage } from "@actions-for-rust/core/dist/utils/errors";
+import { plural } from "./render";
 
 const USER_AGENT = `${pkg.name}/${pkg.version} (${pkg.bugs.url})`;
 
-type ChecksCreateParamsOutputAnnotations = any;
+type GitHubClient = InstanceType<typeof GitHub>;
+type ChecksCreateParamsOutputAnnotations = {
+    annotation_level: "notice" | "warning" | "failure";
+    path: string;
+    start_line: number;
+    end_line: number;
+    title: string;
+    message: string;
+    start_column?: number;
+    end_column?: number;
+};
+
+type CheckUpdateRequest = {
+    owner: string;
+    repo: string;
+    name: string;
+    check_run_id: number;
+    status?: "in_progress" | "completed";
+    conclusion?: string;
+    completed_at?: string;
+    output: {
+        title: string;
+        summary: string;
+        text: string;
+        annotations: ChecksCreateParamsOutputAnnotations[];
+    };
+};
+
+type CheckUpdateParams = Parameters<
+    GitHubClient["rest"]["checks"]["update"]
+>[0];
 
 interface CargoMessage {
-    reason: string,
+    reason: string;
     message: {
-        code: string,
-        level: string,
-        message: string,
-        rendered: string,
-        spans: DiagnosticSpan[],
-    },
+        code: string;
+        level: string;
+        message: string;
+        rendered: string;
+        spans: DiagnosticSpan[];
+    };
 }
 
 interface DiagnosticSpan {
-    file_name: string,
-    is_primary: boolean,
-    line_start: number,
-    line_end: number,
-    column_start: number,
-    column_end: number,
+    file_name: string;
+    is_primary: boolean;
+    line_start: number;
+    line_end: number;
+    column_start: number;
+    column_end: number;
 }
 
 interface CheckOptions {
-    token: string,
-    owner: string,
-    repo: string,
-    name: string,
-    head_sha: string,
-    started_at: string, // ISO8601
+    token: string;
+    owner: string;
+    repo: string;
+    name: string;
+    head_sha: string;
+    started_at: string; // ISO8601
     context: {
-        rustc: string,
-        cargo: string,
-        clippy: string,
-    }
+        rustc: string;
+        cargo: string;
+        clippy: string;
+    };
 }
 
 interface Stats {
-    ice: number,
-    error: number,
-    warning: number,
-    note: number,
-    help: number,
+    ice: number;
+    error: number;
+    warning: number;
+    note: number;
+    help: number;
 }
 
 export class CheckRunner {
@@ -62,42 +93,44 @@ export class CheckRunner {
             warning: 0,
             note: 0,
             help: 0,
-        }
+        };
     }
 
     public tryPush(line: string): void {
         let contents: CargoMessage;
         try {
-            contents = JSON.parse(line);
+            contents = JSON.parse(line) as CargoMessage;
         } catch (error) {
-            core.debug('Not a JSON, ignoring it')
+            core.debug("Not a JSON, ignoring it");
             return;
         }
 
-        if (contents.reason != 'compiler-message') {
-            core.debug(`Unexpected reason field, ignoring it: ${contents.reason}`)
+        if (contents.reason != "compiler-message") {
+            core.debug(
+                `Unexpected reason field, ignoring it: ${contents.reason}`
+            );
             return;
         }
 
         if (contents.message.code === null) {
-            core.debug('Message code is missing, ignoring it');
+            core.debug("Message code is missing, ignoring it");
             return;
         }
 
         switch (contents.message.level) {
-            case 'help':
+            case "help":
                 this.stats.help += 1;
                 break;
-            case 'note':
+            case "note":
                 this.stats.note += 1;
                 break;
-            case 'warning':
+            case "warning":
                 this.stats.warning += 1;
                 break;
-            case 'error':
+            case "error":
                 this.stats.error += 1;
                 break;
-            case 'error: internal compiler error':
+            case "error: internal compiler error":
                 this.stats.ice += 1;
                 break;
             default:
@@ -122,23 +155,27 @@ ${this.stats.help} help`);
         try {
             checkRunId = await this.createCheck(client, options);
         } catch (error) {
-
             // `GITHUB_HEAD_REF` is set only for forked repos,
             // so we could check if it is a fork and not a base repo.
+            const message = getErrorMessage(error);
             if (process.env.GITHUB_HEAD_REF) {
-                core.error(`Unable to create clippy annotations! Reason: ${error}`);
-                core.warning("It seems that this Action is executed from the forked repository.");
+                core.error(
+                    `Unable to create clippy annotations! Reason: ${message}`
+                );
+                core.warning(
+                    "It seems that this Action is executed from the forked repository."
+                );
                 core.warning(`GitHub Actions are not allowed to create Check annotations, \
 when executed for a forked repos. \
 See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
-                core.info('Posting clippy checks here instead.');
+                core.info("Posting clippy checks here instead.");
 
                 this.dumpToStdout();
 
                 // So, if there were any errors, we are considering this output
                 // as failed, throwing an error will set a non-zero exit code later
-                if (this.getConclusion() == 'failure') {
-                    throw new Error('Exiting due to clippy errors');
+                if (this.getConclusion() == "failure") {
+                    throw new Error("Exiting due to clippy errors");
                 } else {
                     // Otherwise if there were no errors (and we do not care about warnings),
                     // exiting successfully.
@@ -161,26 +198,33 @@ See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
         }
     }
 
-    private async createCheck(client: any, options: CheckOptions): Promise<number> {
-        const response = await client.checks.create({
+    private async createCheck(
+        client: GitHubClient,
+        options: CheckOptions
+    ): Promise<number> {
+        const response = await client.rest.checks.create({
             owner: options.owner,
             repo: options.repo,
             name: options.name,
             head_sha: options.head_sha,
-            status: 'in_progress',
+            status: "in_progress",
         });
         // TODO: Check for errors
 
         return response.data.id;
     }
 
-    private async runUpdateCheck(client: any, checkRunId: number, options: CheckOptions): Promise<void> {
+    private async runUpdateCheck(
+        client: GitHubClient,
+        checkRunId: number,
+        options: CheckOptions
+    ): Promise<void> {
         // Checks API allows only up to 50 annotations per request,
         // should group them into buckets
         let annotations = this.getBucket();
         while (annotations.length > 0) {
             // Request data is mostly the same for create/update calls
-            let req: any = {
+            const req: CheckUpdateRequest = {
                 owner: options.owner,
                 repo: options.repo,
                 name: options.name,
@@ -190,24 +234,28 @@ See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
                     summary: this.getSummary(),
                     text: this.getText(options.context),
                     annotations: annotations,
-                }
+                },
             };
 
             if (this.annotations.length > 0) {
                 // There will be more annotations later
-                core.debug('This is not the last iteration, marking check as "in_progress"');
-                req.status = 'in_progress';
+                core.debug(
+                    'This is not the last iteration, marking check as "in_progress"'
+                );
+                req.status = "in_progress";
             } else {
                 // Okay, that was a last one bucket
                 const conclusion = this.getConclusion();
-                core.debug(`This is a last iteration, marking check as "completed", conclusion: ${conclusion}`);
-                req.status = 'completed';
+                core.debug(
+                    `This is a last iteration, marking check as "completed", conclusion: ${conclusion}`
+                );
+                req.status = "completed";
                 req.conclusion = conclusion;
                 req.completed_at = new Date().toISOString();
             }
 
             // TODO: Check for errors
-            await client.checks.update(req);
+            await client.rest.checks.update(req);
 
             annotations = this.getBucket();
         }
@@ -215,47 +263,55 @@ See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
         return;
     }
 
-    private async successCheck(client: any, checkRunId: number, options: CheckOptions): Promise<void> {
-        let req: any = {
+    private async successCheck(
+        client: GitHubClient,
+        checkRunId: number,
+        options: CheckOptions
+    ): Promise<void> {
+        const req: CheckUpdateParams = {
             owner: options.owner,
             repo: options.repo,
             name: options.name,
             check_run_id: checkRunId,
-            status: 'completed',
+            status: "completed",
             conclusion: this.getConclusion(),
             completed_at: new Date().toISOString(),
             output: {
                 title: options.name,
                 summary: this.getSummary(),
                 text: this.getText(options.context),
-            }
+            },
         };
 
         // TODO: Check for errors
-        await client.checks.update(req);
+        await client.rest.checks.update(req);
 
         return;
     }
 
     /// Cancel whole check if some unhandled exception happened.
-    private async cancelCheck(client: any, checkRunId: number, options: CheckOptions): Promise<void> {
-        let req: any = {
+    private async cancelCheck(
+        client: GitHubClient,
+        checkRunId: number,
+        options: CheckOptions
+    ): Promise<void> {
+        const req: CheckUpdateParams = {
             owner: options.owner,
             repo: options.repo,
             name: options.name,
             check_run_id: checkRunId,
-            status: 'completed',
-            conclusion: 'cancelled',
+            status: "completed",
+            conclusion: "cancelled",
             completed_at: new Date().toISOString(),
             output: {
                 title: options.name,
-                summary: 'Unhandled error',
-                text: 'Check was cancelled due to unhandled error. Check the Action logs for details.',
-            }
+                summary: "Unhandled error",
+                text: "Check was cancelled due to unhandled error. Check the Action logs for details.",
+            },
         };
 
         // TODO: Check for errors
-        await client.checks.update(req);
+        await client.rest.checks.update(req);
 
         return;
     }
@@ -268,7 +324,7 @@ See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
 
     private getBucket(): Array<ChecksCreateParamsOutputAnnotations> {
         // TODO: Use slice or smth?
-        let annotations: Array<ChecksCreateParamsOutputAnnotations> = [];
+        const annotations: ChecksCreateParamsOutputAnnotations[] = [];
         while (annotations.length < 50) {
             const annotation = this.annotations.pop();
             if (annotation) {
@@ -278,31 +334,41 @@ See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
             }
         }
 
-        core.debug(`Prepared next annotations bucket, ${annotations.length} size`);
+        core.debug(
+            `Prepared next annotations bucket, ${annotations.length} size`
+        );
 
         return annotations;
     }
 
     private getSummary(): string {
-        let blocks: string[] = [];
+        const blocks: string[] = [];
 
         if (this.stats.ice > 0) {
-            blocks.push(`${this.stats.ice} internal compiler error${plural(this.stats.ice)}`);
+            blocks.push(
+                `${this.stats.ice} internal compiler error${plural(
+                    this.stats.ice
+                )}`
+            );
         }
         if (this.stats.error > 0) {
             blocks.push(`${this.stats.error} error${plural(this.stats.error)}`);
         }
         if (this.stats.warning > 0) {
-            blocks.push(`${this.stats.warning} warning${plural(this.stats.warning)}`);
+            blocks.push(
+                `${this.stats.warning} warning${plural(this.stats.warning)}`
+            );
         }
         if (this.stats.note > 0) {
             blocks.push(`${this.stats.note} note${plural(this.stats.note)}`);
         }
         if (this.stats.help > 0) {
-            blocks.push(`${this.stats.help} help message${plural(this.stats.help)}`);
+            blocks.push(
+                `${this.stats.help} help message${plural(this.stats.help)}`
+            );
         }
 
-        return blocks.join(', ');
+        return blocks.join(", ");
     }
 
     private getText(context: CheckOptions["context"]): string {
@@ -326,43 +392,51 @@ See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
 
     private getConclusion(): string {
         if (this.stats.ice > 0 || this.stats.error > 0) {
-            return 'failure';
+            return "failure";
         } else {
-            return 'success';
+            return "success";
         }
     }
 
     private isSuccessCheck(): boolean {
-        return this.stats.ice == 0 && this.stats.error == 0 && this.stats.warning == 0 &&
-            this.stats.note == 0 && this.stats.help == 0;
+        return (
+            this.stats.ice == 0 &&
+            this.stats.error == 0 &&
+            this.stats.warning == 0 &&
+            this.stats.note == 0 &&
+            this.stats.help == 0
+        );
     }
 
     /// Convert parsed JSON line into the GH annotation object
     ///
     /// https://developer.github.com/v3/checks/runs/#annotations-object
-    static makeAnnotation(contents: CargoMessage): ChecksCreateParamsOutputAnnotations {
-        const primarySpan: undefined | DiagnosticSpan = contents.message.spans.find((span) => span.is_primary == true);
+    static makeAnnotation(
+        contents: CargoMessage
+    ): ChecksCreateParamsOutputAnnotations {
+        const primarySpan: undefined | DiagnosticSpan =
+            contents.message.spans.find((span) => span.is_primary == true);
         // TODO: Handle it properly
         if (null == primarySpan) {
-            throw new Error('Unable to find primary span for message');
+            throw new Error("Unable to find primary span for message");
         }
 
         let annotation_level: ChecksCreateParamsOutputAnnotations["annotation_level"];
         // notice, warning, or failure.
         switch (contents.message.level) {
-            case 'help':
-            case 'note':
-                annotation_level = 'notice';
+            case "help":
+            case "note":
+                annotation_level = "notice";
                 break;
-            case 'warning':
-                annotation_level = 'warning';
+            case "warning":
+                annotation_level = "warning";
                 break;
             default:
-                annotation_level = 'failure';
+                annotation_level = "failure";
                 break;
         }
 
-        let annotation: ChecksCreateParamsOutputAnnotations = {
+        const annotation: ChecksCreateParamsOutputAnnotations = {
             path: primarySpan.file_name,
             start_line: primarySpan.line_start,
             end_line: primarySpan.line_end,
@@ -379,5 +453,4 @@ See https://github.com/actions-rs/clippy-check/issues/2 for details.`);
 
         return annotation;
     }
-
 }
